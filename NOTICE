@@ -1,0 +1,19 @@
+job-search-agent
+Copyright (c) 2026 Joshua Stubblefield and contributors
+
+Licensed under the PolyForm Noncommercial License 1.0.0.
+See the LICENSE file for the full terms.
+
+Summary (non-binding — the LICENSE file controls):
+- You may use, modify, and share this software for any noncommercial purpose.
+- You may NOT use this software, or anything substantially derived from it,
+  as part of a product or service that you or a third party sells, resells,
+  licenses, hosts for a fee, or otherwise uses to generate revenue.
+- "Noncommercial" includes personal use, hobby projects, academic research,
+  and use by nonprofits for their noncommercial activities.
+
+If you want a commercial license, open an issue on GitHub to discuss.
+
+This project uses several third-party libraries and APIs. See
+dashboard/package.json, scraper/requirements.txt, and classifier/requirements.txt
+for their respective licenses.

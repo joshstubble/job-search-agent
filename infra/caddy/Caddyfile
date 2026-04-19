@@ -1,0 +1,20 @@
+# Hetzner-only (profile: hetzner). Swap HOSTNAME for the real FQDN and supply basic-auth
+# credentials via env (CADDY_BASIC_AUTH) before pushing to the box. Locally we stay on
+# 127.0.0.1 and never route through Caddy.
+
+{
+    # email for ACME account registration on Hetzner
+    # email you@example.com
+}
+
+:80 {
+    redir https://{host}{uri} permanent
+}
+
+:443 {
+    # Replace with your hostname once provisioned on Hetzner.
+    # basicauth /* {
+    #     user JDJhJDEw...  # `caddy hash-password`
+    # }
+    reverse_proxy dashboard:3000
+}

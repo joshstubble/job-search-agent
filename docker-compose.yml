@@ -1,0 +1,189 @@
+# job-search-agent — generic, single-user, local-first job-search pipeline.
+# One compose file boots everything (except the Chrome extension, which runs in the user's Chrome).
+# Profiles:
+#   (default) postgres, dbmate, scraper, classifier, dashboard, ofelia
+#   dev       +pgadmin, +extension-build watcher
+#   apply-v2  +stagehand   (M7)
+#   hetzner   +caddy       (TLS + basic-auth; bypassed locally since we're 127.0.0.1-bound)
+
+name: job-search-agent
+
+x-app-env: &app-env
+  DATABASE_URL: ${DATABASE_URL}
+  OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+  USAJOBS_API_KEY: ${USAJOBS_API_KEY:-}
+  USAJOBS_EMAIL: ${USAJOBS_EMAIL:-}
+  ADZUNA_APP_ID: ${ADZUNA_APP_ID:-}
+  ADZUNA_APP_KEY: ${ADZUNA_APP_KEY:-}
+  SEARCH_KEYWORDS: ${SEARCH_KEYWORDS:-}
+  SEARCH_LOCATION: ${SEARCH_LOCATION:-}
+  SEARCH_DISTANCE_MI: ${SEARCH_DISTANCE_MI:-100}
+  TARGET_FIELD: ${TARGET_FIELD:-}
+  TARGET_SENIORITY: ${TARGET_SENIORITY:-}
+  TARGET_PROFILE_NOTES: ${TARGET_PROFILE_NOTES:-}
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  # One-shot: runs SQL migrations against postgres, then exits.
+  # App services gate on `service_completed_successfully` so nothing starts until schema is applied.
+  dbmate:
+    image: ghcr.io/amacneil/dbmate:latest
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+    volumes:
+      - ./infra/migrations:/db/migrations
+    command: ["--wait", "up"]
+
+  scraper:
+    build: ./scraper
+    restart: unless-stopped
+    depends_on:
+      dbmate:
+        condition: service_completed_successfully
+    environment: *app-env
+    volumes:
+      - ./scraper:/app
+    # ofelia job-exec's into this container on schedule. See labels.
+    command: ["sleep", "infinity"]
+    labels:
+      ofelia.enabled: "true"
+      # 7:00 and 19:00 local (America/New_York — see ofelia service TZ).
+      # Cron format is 6-field (seconds first).
+      ofelia.job-exec.scrape.schedule: "0 0 7,19 * * *"
+      ofelia.job-exec.scrape.command: "python /app/run.py"
+
+  classifier:
+    build: ./classifier
+    restart: unless-stopped
+    depends_on:
+      dbmate:
+        condition: service_completed_successfully
+    environment: *app-env
+    volumes:
+      - ./classifier:/app
+    command: ["sleep", "infinity"]
+    labels:
+      ofelia.enabled: "true"
+      # 10 min after scraper so new jobs are in the DB before classifying.
+      ofelia.job-exec.classify.schedule: "0 10 7,19 * * *"
+      ofelia.job-exec.classify.command: "python /app/run.py"
+
+  dashboard:
+    build: ./dashboard
+    restart: unless-stopped
+    depends_on:
+      dbmate:
+        condition: service_completed_successfully
+    environment:
+      <<: *app-env
+      NODE_ENV: development
+      # Next dev needs to reach the classifier over the compose network for on-demand drafts.
+      CLASSIFIER_URL: http://classifier:8000
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - ./dashboard:/app
+      # node_modules shared with the host (no named-volume overlay). Host + container
+      # are linux/arm64 on Docker Desktop Mac M-series, so native deps compile once.
+    # Dockerfile CMD is `pnpm dev --hostname 0.0.0.0 --port 3000`.
+
+  ofelia:
+    image: mcuadros/ofelia:latest
+    restart: unless-stopped
+    depends_on:
+      dbmate:
+        condition: service_completed_successfully
+    # TZ so the scraper/classifier labels' cron expressions are local-time.
+    environment:
+      TZ: America/New_York
+    command: daemon --docker -f label=com.docker.compose.project=law
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+  # ---- dev profile ------------------------------------------------------------
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    restart: unless-stopped
+    profiles: ["dev"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@local
+      PGADMIN_DEFAULT_PASSWORD: admin
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+    ports:
+      - "127.0.0.1:5050:80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+
+  # Bundles the MV3 extension from apply-helper/extension → apply-helper/dist via vite --watch.
+  # Wired up in M5.
+  extension-build:
+    image: node:20-slim
+    profiles: ["dev"]
+    working_dir: /app
+    volumes:
+      - ./apply-helper:/app
+      - extension_node_modules:/app/node_modules
+    command: ["sleep", "infinity"]
+
+  # ---- apply-v2 profile (M7) --------------------------------------------------
+  stagehand:
+    image: node:20-slim
+    profiles: ["apply-v2"]
+    depends_on:
+      dbmate:
+        condition: service_completed_successfully
+    environment: *app-env
+    working_dir: /app
+    volumes:
+      - ./apply-helper:/app
+      - stagehand_node_modules:/app/node_modules
+    command: ["sleep", "infinity"]
+
+  # ---- hetzner profile --------------------------------------------------------
+  # Local dev is 127.0.0.1-only so Caddy does nothing useful here.
+  # On the Hetzner box (M8) we `docker compose --profile hetzner up -d` to get TLS.
+  caddy:
+    image: caddy:2
+    profiles: ["hetzner"]
+    restart: unless-stopped
+    depends_on:
+      - dashboard
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./infra/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  pgdata:
+  pgadmin_data:
+  extension_node_modules:
+  stagehand_node_modules:
+  caddy_data:
+  caddy_config:
